@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+*.log
+.venv/
+venv/
+
+# Documents (don't commit test files)
+*.pdf
+*.PDF
+*.docx
+*.DOCX
+*.doc
+*.DOC
+*.xlsx
+*.XLSX
+*.xls
+*.XLS
+*.pptx
+*.PPTX
+*.ppt
+*.PPT
+
+# Images & archives
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.zip
+*.rar
+
+# OS
+.DS_Store
+Thumbs.db
