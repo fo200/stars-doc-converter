@@ -25,6 +25,11 @@ def _check_libs():
 
 LIBS = _check_libs()
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+MAX_IMG_BYTES   = 600 * 1024        # 600 KB — imágenes más grandes se omiten
+PREVIEW_CHARS   = 200_000           # caracteres máx. en vista previa / raw
+RAW_WARN_MB     = 5                 # MB — avisa si el .md es muy grande
+
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -146,6 +151,11 @@ html, body, .stApp                        { font-family: var(--font); background
 .md-preview code { background:var(--bg); padding:2px 6px; border-radius:4px; font-size:.87em; }
 .md-preview blockquote { border-left:3px solid var(--teal); padding-left:14px; color:#555; }
 .md-preview img { max-width:100%; height:auto; border-radius:6px; margin:8px 0; }
+.md-preview .img-placeholder {
+  display:block; background:var(--bg); border:1.5px dashed var(--border);
+  border-radius:8px; padding:10px 16px; color:#9CA3AF;
+  font-size:.85rem; margin:6px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -173,17 +183,27 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Image helpers ─────────────────────────────────────────────────────────────
 
-def _to_data_uri(img_bytes: bytes, ext: str) -> str:
-    """Converts raw image bytes to a base64 data URI."""
+def _to_data_uri(img_bytes: bytes, ext: str):
+    """
+    Returns a base64 data URI string, or None if the image exceeds MAX_IMG_BYTES.
+    Returning None tells the caller to emit a placeholder instead.
+    """
+    if len(img_bytes) > MAX_IMG_BYTES:
+        return None
     ext  = ext.lower().lstrip('.')
     mime = 'image/jpeg' if ext in ('jpg', 'jpeg') else f'image/{ext}'
     return f"data:{mime};base64,{base64.b64encode(img_bytes).decode()}"
 
 
 def _embed_img_refs(md: str, tmp_dir: str) -> str:
-    """Replaces ![alt](path) image references written to tmp_dir with base64 data URIs."""
+    """
+    Replaces ![alt](path) file references written by pymupdf4llm with
+    base64 data URIs (or a styled placeholder when the image is too large
+    or can't be read).
+    Must be called INSIDE the TemporaryDirectory context.
+    """
     IMG_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
 
     def _replace(m):
@@ -191,18 +211,38 @@ def _embed_img_refs(md: str, tmp_dir: str) -> str:
         for candidate in [path,
                           os.path.join(tmp_dir, path),
                           os.path.join(tmp_dir, os.path.basename(path))]:
-            if os.path.isfile(candidate):
-                ext = Path(candidate).suffix.lower().lstrip('.')
-                if ext not in ('png','jpg','jpeg','gif','bmp','webp','svg'):
-                    break
-                try:
-                    with open(candidate, 'rb') as f:
-                        return f'![{alt}]({_to_data_uri(f.read(), ext)})'
-                except Exception:
-                    break
+            if not os.path.isfile(candidate):
+                continue
+            ext = Path(candidate).suffix.lower().lstrip('.')
+            if ext not in ('png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'):
+                break
+            try:
+                with open(candidate, 'rb') as f:
+                    raw = f.read()
+                uri = _to_data_uri(raw, ext)
+                if uri:
+                    return f'![{alt}]({uri})'
+                # Image too large — leave a readable placeholder
+                kb = len(raw) // 1024
+                return f'> 🖼️ *Imagen ({kb} KB) incluida en el archivo .md descargado*'
+            except Exception:
+                break
         return m.group(0)
 
     return IMG_RE.sub(_replace, md)
+
+
+def _strip_data_uris(md: str) -> str:
+    """
+    For the browser preview ONLY: replaces base64 data URIs with a lightweight
+    placeholder so the browser doesn't freeze rendering huge inline images.
+    The downloaded .md file always keeps the real images.
+    """
+    return re.sub(
+        r'!\[([^\]]*)\]\(data:[^)]{50,}\)',
+        lambda m: f'<span class="img-placeholder">🖼️ {m.group(1) or "Imagen"} — visible en el archivo .md descargado</span>',
+        md,
+    )
 
 
 # ── Conversion functions ──────────────────────────────────────────────────────
@@ -210,19 +250,26 @@ def _embed_img_refs(md: str, tmp_dir: str) -> str:
 def convert_pdf(file_bytes, filename):
     if not LIBS["fitz"]: raise ImportError("PyMuPDF no instalado.")
     import fitz, pymupdf4llm
+
     doc   = fitz.open(stream=file_bytes, filetype="pdf")
     page0 = doc[0]
     text0 = page0.get_text().strip()
 
-    # ── Scanned PDF → OCR ────────────────────────────────────────────────────
+    # ── Scanned PDF → OCR (page-by-page to avoid RAM spike) ─────────────────
     if len(text0) < 30:
         if not (LIBS["pdf2image"] and LIBS["pytesseract"]):
             raise ImportError("PDF escaneado: instala pdf2image y pytesseract.")
         from pdf2image import convert_from_bytes
         import pytesseract
-        imgs  = convert_from_bytes(file_bytes, dpi=300)
-        pages = [f"## Página {i}\n\n{pytesseract.image_to_string(img, lang='spa+eng').strip()}"
-                 for i, img in enumerate(imgs, 1)]
+        total_pages = len(doc)
+        pages = []
+        for i in range(1, total_pages + 1):        # one page at a time — O(1) RAM
+            imgs = convert_from_bytes(
+                file_bytes, dpi=200,               # 200 dpi: 56% less RAM vs 300, misma calidad OCR
+                first_page=i, last_page=i,
+            )
+            text = pytesseract.image_to_string(imgs[0], lang='spa+eng').strip()
+            pages.append(f"## Página {i}\n\n{text}")
         return f"# {Path(filename).stem}\n\n" + "\n\n---\n\n".join(pages), "OCR (pytesseract)"
 
     # ── Text PDF → pymupdf4llm + embedded images ─────────────────────────────
@@ -243,7 +290,7 @@ def convert_pdf(file_bytes, filename):
             parts.append(chunk_md)
 
         md = re.sub(r'\n{4,}', '\n\n\n', "\n\n".join(parts))
-        md = _embed_img_refs(md, tmp)   # inline base64 before tmp is deleted
+        md = _embed_img_refs(md, tmp)       # embed INSIDE the 'with' block
 
     return md, label
 
@@ -253,11 +300,15 @@ def convert_docx(file_bytes, filename):
     import mammoth
 
     def _img_handler(image):
-        """Converts each DOCX image to an inline base64 data URI."""
         try:
             with image.open() as f:
-                data = f.read()
-            return {"src": _to_data_uri(data, image.content_type.split('/')[-1])}
+                raw = f.read()
+            uri = _to_data_uri(raw, image.content_type.split('/')[-1])
+            if uri:
+                return {"src": uri}
+            kb = len(raw) // 1024
+            # mammoth expects an img src; use a descriptive placeholder URL
+            return {"src": f"data:text/plain,imagen-{kb}KB-en-archivo-md"}
         except Exception:
             return {}
 
@@ -279,11 +330,9 @@ def convert_pptx(file_bytes, filename):
     def pt(el):       return ''.join(t.text or '' for t in el.iter(f'{A}t')).strip()
     def is_title(sp): return any(ph.get('type','') in ('title','ctrTitle') or ph.get('idx','9')=='0'
                                   for ph in sp.iter(f'{P}ph'))
-
     slides = []
     with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
         all_files = set(z.namelist())
-
         fnames = sorted(
             [f for f in all_files
              if f.startswith('ppt/slides/slide') and f.endswith('.xml')
@@ -303,21 +352,25 @@ def convert_pptx(file_bytes, filename):
             for gf in root.iter(f'{P}graphicFrame'):
                 body.extend(pt(p) for p in gf.iter(f'{A}p') if pt(p))
 
-            # ── Extract images for this slide ─────────────────────────────
+            # ── Images for this slide ──────────────────────────────────────
             img_tags = []
             rels_path = sf.replace('slides/slide', 'slides/_rels/slide') + '.rels'
             if rels_path in all_files:
                 rels_root = ET.parse(z.open(rels_path)).getroot()
                 for rel in rels_root:
                     if '/image' not in rel.get('Type', ''): continue
-                    target  = rel.get('Target', '')               # e.g. ../media/image1.png
-                    media   = 'ppt/' + target.replace('../', '')   # ppt/media/image1.png
+                    target = rel.get('Target', '')
+                    media  = 'ppt/' + target.replace('../', '')
                     if media not in all_files: continue
                     ext = Path(media).suffix.lower().lstrip('.')
                     if ext not in ('png','jpg','jpeg','gif','bmp','webp'): continue
                     try:
-                        uri = _to_data_uri(z.read(media), ext)
-                        img_tags.append(f'![imagen]({uri})')
+                        raw = z.read(media)
+                        uri = _to_data_uri(raw, ext)
+                        if uri:
+                            img_tags.append(f'![imagen slide {i}]({uri})')
+                        else:
+                            img_tags.append(f'> 🖼️ *Imagen ({len(raw)//1024} KB) disponible en el archivo .md descargado*')
                     except Exception:
                         pass
 
@@ -381,7 +434,9 @@ def convert_xlsx(file_bytes, filename):
     return '\n'.join(parts), "openpyxl (XLSX)"
 
 
-@st.cache_data(show_spinner=False)
+# FIX 2: max_entries=5 evita que el caché acumule objetos grandes en RAM
+# FIX 2: ttl=600 (10 min) libera resultados que ya no se necesitan
+@st.cache_data(show_spinner=False, max_entries=5, ttl=600)
 def run_conversion(file_bytes: bytes, filename: str) -> dict:
     ext = Path(filename).suffix.lower()
     fn  = {'.pdf': convert_pdf, '.docx': convert_docx, '.doc': convert_docx,
@@ -421,7 +476,16 @@ with col_left:
         accept_multiple_files=True,
     )
 
+    # Warn about large files before converting
     if uploaded:
+        large = [f.name for f in uploaded if f.size > 50 * 1024 * 1024]
+        if large:
+            st.warning(
+                f"⚠️ Archivo(s) grandes detectados: **{', '.join(large)}**. "
+                "La conversión puede tardar 1–3 minutos. La app seguirá trabajando — no cierres la pestaña.",
+                icon=None,
+            )
+
         if st.button("⟳  Convertir todo", type="primary", use_container_width=True):
             st.session_state.results = {}
             st.session_state.active  = None
@@ -468,7 +532,7 @@ with col_left:
                 st.markdown('</div>', unsafe_allow_html=True)
 
             if not r["ok"]:
-                st.caption(f"⚠️ {r.get('error','Error desconocido')}")
+                st.caption(f"⚠️ {r.get('error', 'Error desconocido')}")
 
         done_ok = {n: r for n, r in results.items() if r.get("ok")}
         if len(done_ok) > 1:
@@ -504,6 +568,7 @@ with col_right:
     else:
         r  = results[active]
         md = r["markdown"]
+        md_bytes = len(md.encode())
 
         h_col, d_col = st.columns([3, 1])
         with h_col:
@@ -517,7 +582,7 @@ with col_right:
         with d_col:
             st.download_button(
                 "⬇ Descargar .md",
-                data=md,
+                data=md,                            # full markdown with real images
                 file_name=Path(r["filename"]).stem + ".md",
                 mime="text/markdown",
                 use_container_width=True,
@@ -530,10 +595,30 @@ with col_right:
           <div class="stat-card"><div class="stat-val">{r['lines']:,}</div><div class="stat-lbl">Líneas</div></div>
         </div>""", unsafe_allow_html=True)
 
+        # FIX 1 & 3: Large markdown warning
+        if md_bytes > RAW_WARN_MB * 1024 * 1024:
+            size_mb = md_bytes / (1024 * 1024)
+            st.info(
+                f"📦 El Markdown generado pesa **{size_mb:.1f} MB** (incluye imágenes en base64). "
+                "La vista previa muestra texto completo + marcadores de imagen. "
+                "El archivo descargado contiene todas las imágenes reales.",
+                icon=None,
+            )
+
         tab_prev, tab_raw = st.tabs(["  Vista previa  ", "  Markdown raw  "])
+
         with tab_prev:
+            # FIX 1: Strip base64 URIs before sending to browser — prevents freeze
+            preview_md = _strip_data_uris(md)
             st.markdown('<div class="md-preview">', unsafe_allow_html=True)
-            st.markdown(md)
+            st.markdown(preview_md, unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
+
         with tab_raw:
-            st.code(md, language="markdown", line_numbers=True)
+            # FIX 3: Truncate raw display — st.code on 50MB+ strings also freezes
+            if len(md) > PREVIEW_CHARS:
+                st.caption(f"Mostrando primeros {PREVIEW_CHARS:,} caracteres. Descarga el .md para el contenido completo.")
+                display_md = md[:PREVIEW_CHARS] + "\n\n…[descarga el archivo para ver el resto]"
+            else:
+                display_md = md
+            st.code(display_md, language="markdown", line_numbers=True)

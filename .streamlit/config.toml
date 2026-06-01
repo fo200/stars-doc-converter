@@ -1,0 +1,7 @@
+[server]
+maxUploadSize   = 200   # MB por archivo
+maxMessageSize  = 500   # MB — evita que el WebSocket se corte con markdowns grandes
+headless        = true
+
+[browser]
+gatherUsageStats = false
