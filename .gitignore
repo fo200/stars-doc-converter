@@ -31,6 +31,10 @@ venv/
 *.zip
 *.rar
 
+# Test harness (se conservan los scripts, no los archivos generados)
+test_harness/docs/
+test_harness/out/
+
 # OS
 .DS_Store
 Thumbs.db
