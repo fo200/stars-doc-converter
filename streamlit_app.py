@@ -390,10 +390,10 @@ def convert_docx(file_bytes, filename, include_images=True):
 def _decode_text(file_bytes: bytes) -> str:
     """UTF-8 (con o sin BOM) primero; si falla, cp1252 — el encoding típico
     de exportes legacy de Windows en español. Nunca produce mojibake '�'."""
-    for enc in ('utf-8-sig', 'utf-8'):
+    for enc in ('utf-16', 'utf-8-sig', 'utf-8'):
         try:
             return file_bytes.decode(enc)
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, UnicodeError):
             pass
     try:
         return file_bytes.decode('cp1252')
@@ -430,7 +430,7 @@ def convert_csv(file_bytes, filename):
     import csv
     # csv.reader requiere newline='' para manejar saltos de línea dentro de celdas.
     # Probar encodings en orden; detach() antes de salir evita cerrar el BytesIO.
-    for enc in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
+    for enc in ('utf-16', 'utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
         try:
             raw = file_bytes.decode(enc)          # validar encoding completamente
         except UnicodeDecodeError:
