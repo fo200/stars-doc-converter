@@ -405,16 +405,45 @@ def convert_txt(file_bytes, filename):
     return f"# {Path(filename).stem}\n\n{_decode_text(file_bytes)}", "texto plano"
 
 
+def _csv_best_delimiter(sample: str) -> str:
+    """Retorna el delimitador más probable en base al texto de muestra."""
+    import csv
+    # Intentar sniffer primero con cada delimitador individualmente
+    for delim in (';', ',', '\t'):
+        try:
+            d = csv.Sniffer().sniff(sample, delimiters=delim)
+            # Validar: la primera línea no-vacía debe tener > 1 columna
+            first = next((l for l in sample.splitlines() if l.strip()), '')
+            test_rows = list(csv.reader([first], delimiter=d.delimiter))
+            if test_rows and len(test_rows[0]) > 1:
+                return d.delimiter
+        except csv.Error:
+            pass
+    # Fallback: contar ocurrencias en primera línea completa
+    first = next((l for l in sample.splitlines() if l.strip()), sample)
+    counts = {d: first.count(d) for d in (';', ',', '\t')}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else ','
+
+
 def convert_csv(file_bytes, filename):
     import csv
-    text = _decode_text(file_bytes)
-    # Detecta delimitador (";" es lo habitual en Excel configurado en español)
-    try:
-        dialect = csv.Sniffer().sniff(text[:4096], delimiters=',;\t')
-    except csv.Error:
-        dialect = csv.excel
-    rows = [list(r) for r in csv.reader(io.StringIO(text), dialect) if any(c.strip() for c in r)]
-    return f"# {Path(filename).stem}\n\n{_md_table(rows)}", "csv"
+    # csv.reader requiere newline='' para manejar saltos de línea dentro de celdas.
+    # Probar encodings en orden; detach() antes de salir evita cerrar el BytesIO.
+    for enc in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
+        try:
+            raw = file_bytes.decode(enc)          # validar encoding completamente
+        except UnicodeDecodeError:
+            continue
+        f = io.StringIO(raw, newline='')          # StringIO con newline='' desde Python 3
+        sample = f.read(4096); f.seek(0)
+        delim = _csv_best_delimiter(sample)
+        rows = [list(r) for r in csv.reader(f, delimiter=delim)
+                if any(c.strip() for c in r)]
+        if not rows:
+            continue
+        return f"# {Path(filename).stem}\n\n{_md_table(rows)}", "csv"
+    raise ValueError("No se pudo leer el CSV: encoding desconocido.")
 
 
 def convert_pptx(file_bytes, filename, include_images=True):
