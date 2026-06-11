@@ -16,7 +16,7 @@ st.set_page_config(
 def _check_libs():
     libs = {}
     for key, mod in [("fitz","fitz"),("pymupdf4llm","pymupdf4llm"),
-                     ("mammoth","mammoth"),("pdf2image","pdf2image"),
+                     ("mammoth","mammoth"),
                      ("pytesseract","pytesseract"),
                      ("openpyxl","openpyxl"),("xlrd","xlrd"),
                      ("markdownify","markdownify")]:
@@ -248,62 +248,97 @@ def _strip_data_uris(md: str) -> str:
 
 # ── Conversion functions ──────────────────────────────────────────────────────
 
+def _ocr_pdf_pages(doc, filename):
+    """OCR página por página con fitz + pytesseract.
+    Una sola página en RAM a la vez (antes pdf2image cargaba TODO el PDF
+    rasterizado de golpe → OOM en Streamlit Cloud con PDFs largos).
+    No requiere poppler: fitz rasteriza directo."""
+    import fitz, pytesseract
+    from PIL import Image
+
+    pages = []
+    for i in range(len(doc)):
+        pix = doc[i].get_pixmap(dpi=150, colorspace=fitz.csGRAY)
+        img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+        pix = None
+        try:
+            text = pytesseract.image_to_string(img, lang="spa+eng")
+        except pytesseract.TesseractError:
+            text = pytesseract.image_to_string(img)   # sin paquete de idioma
+        img.close()
+        pages.append(f"## Página {i + 1}\n\n{text.strip()}")
+    return f"# {Path(filename).stem}\n\n" + "\n\n---\n\n".join(pages)
+
+
 def convert_pdf(file_bytes, filename, include_images=True):
     if not LIBS["fitz"]: raise ImportError("PyMuPDF no instalado.")
     import fitz, pymupdf4llm
 
-    doc   = fitz.open(stream=file_bytes, filetype="pdf")
-    total = len(doc)
+    # pymupdf4llm >= 1.26 activa por defecto un modelo ML de layout (~200 MB
+    # de RAM, 5x más lento y con OCR implícito sobre páginas con imágenes).
+    # El modo clásico es liviano y suficiente — crítico en Streamlit Cloud (1 GB).
+    if hasattr(pymupdf4llm, "use_layout"):
+        pymupdf4llm.use_layout(False)
 
-    # Scanned-PDF detection: sample several pages, not just the cover.
-    # A text PDF with an image-only cover page must NOT be routed to OCR.
-    sample_idx = sorted({0, min(1, total - 1), total // 2, total - 1})
-    sample_chars = [len(doc[i].get_text().strip()) for i in sample_idx]
-    is_scanned = all(c < 30 for c in sample_chars)
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        total = len(doc)
+        if total == 0:
+            raise ValueError("El PDF no tiene páginas (¿archivo corrupto?).")
 
-    # ── Scanned PDF → OCR ────────────────────────────────────────────────────
-    if is_scanned:
-        if not (LIBS["pdf2image"] and LIBS["pytesseract"]):
-            raise ImportError("PDF escaneado: instala pdf2image y pytesseract.")
-        from pdf2image import convert_from_bytes
-        import pytesseract
-        # FIX: load all pages in ONE call — the previous per-page loop was O(n²)
-        # because each convert_from_bytes re-decoded the whole PDF up to that page.
-        # 150 dpi is enough for OCR accuracy and uses 44% less RAM than 200 dpi.
-        imgs  = convert_from_bytes(file_bytes, dpi=150, thread_count=2)
-        pages = [f"## Página {i}\n\n{pytesseract.image_to_string(img, lang='spa+eng').strip()}"
-                 for i, img in enumerate(imgs, 1)]
-        return f"# {Path(filename).stem}\n\n" + "\n\n---\n\n".join(pages), "OCR (pytesseract)"
+        # Scanned-PDF detection: sample several pages, not just the cover.
+        # A text PDF with an image-only cover page must NOT be routed to OCR.
+        sample_idx = sorted({0, min(1, total - 1), total // 2, total - 1})
+        sample_chars = [len(doc[i].get_text().strip()) for i in sample_idx]
+        is_scanned = all(c < 30 for c in sample_chars)
 
-    # ── Text PDF → pymupdf4llm ────────────────────────────────────────────────
-    label = "pymupdf4llm (word PDF)" if doc[0].get_fonts() else "pymupdf4llm (plain PDF)"
+        # ── Scanned PDF → OCR ────────────────────────────────────────────────
+        if is_scanned:
+            if not LIBS["pytesseract"]:
+                raise ImportError("PDF escaneado: instala pytesseract.")
+            return _ocr_pdf_pages(doc, filename), "OCR (pytesseract)"
 
-    if not include_images:
-        # FIX: text-only is 3–5x faster — larger chunks, no disk I/O for images
-        CHUNK = 50
-        parts = [pymupdf4llm.to_markdown(doc, pages=list(range(s, min(s + CHUNK, total))))
-                 for s in range(0, total, CHUNK)]
-        md = re.sub(r'\n{4,}', '\n\n\n', "\n\n".join(parts))
+        # ── Text PDF → pymupdf4llm ────────────────────────────────────────────
+        label = "pymupdf4llm (word PDF)" if doc[0].get_fonts() else "pymupdf4llm (plain PDF)"
+
+        if not include_images:
+            # FIX: text-only is 3–5x faster — larger chunks, no disk I/O for images
+            CHUNK = 50
+            parts = [pymupdf4llm.to_markdown(doc, filename=filename,
+                                             pages=list(range(s, min(s + CHUNK, total))))
+                     for s in range(0, total, CHUNK)]
+            md = re.sub(r'\n{4,}', '\n\n\n', "\n\n".join(parts))
+            return md, label
+
+        # Images requested — write to temp dir then embed as base64
+        CHUNK = 20
+        with tempfile.TemporaryDirectory() as tmp:
+            parts = []
+            for s in range(0, total, CHUNK):
+                chunk_md = pymupdf4llm.to_markdown(
+                    doc,
+                    # filename es OBLIGATORIO con write_images cuando el doc se
+                    # abre desde memoria: sin él, save_image() crashea (filename=None)
+                    filename=filename,
+                    pages=list(range(s, min(s + CHUNK, total))),
+                    write_images=True,
+                    image_path=tmp,
+                    image_format="png",
+                )
+                parts.append(chunk_md)
+
+            md = re.sub(r'\n{4,}', '\n\n\n', "\n\n".join(parts))
+            md = _embed_img_refs(md, tmp)       # embed INSIDE the 'with' block
+
         return md, label
-
-    # Images requested — write to temp dir then embed as base64
-    CHUNK = 20
-    with tempfile.TemporaryDirectory() as tmp:
-        parts = []
-        for s in range(0, total, CHUNK):
-            chunk_md = pymupdf4llm.to_markdown(
-                doc,
-                pages=list(range(s, min(s + CHUNK, total))),
-                write_images=True,
-                image_path=tmp,
-                image_format="png",
-            )
-            parts.append(chunk_md)
-
-        md = re.sub(r'\n{4,}', '\n\n\n', "\n\n".join(parts))
-        md = _embed_img_refs(md, tmp)       # embed INSIDE the 'with' block
-
-    return md, label
+    finally:
+        doc.close()
+        # Vaciar el caché global de MuPDF — sin esto cada conversión deja
+        # ~12 MB residentes y los documentos seguidos agotan la RAM del contenedor.
+        try:
+            fitz.TOOLS.store_shrink(100)
+        except Exception:
+            pass
 
 
 def _html_to_md(html: str) -> str:
@@ -621,7 +656,11 @@ def convert_xlsx(file_bytes, filename):
     return '\n'.join(parts), "openpyxl (XLSX)"
 
 
-@st.cache_data(show_spinner=False, max_entries=5, ttl=600)
+# NOTA: sin @st.cache_data — el caché guardaba hasta 5 copias pickled de
+# resultados gigantes (markdown con imágenes base64) ADEMÁS de la copia en
+# session_state, y hasheaba los bytes completos del archivo en cada llamada.
+# En Streamlit Cloud (1 GB) eso provocaba OOM al convertir documentos seguidos.
+# El dedup se hace manualmente con md5 en el handler del botón.
 def run_conversion(file_bytes: bytes, filename: str, include_images: bool = False) -> dict:
     ext = Path(filename).suffix.lower()
     fn  = {'.pdf': convert_pdf, '.docx': convert_docx, '.doc': convert_docx,
@@ -687,6 +726,8 @@ with col_left:
             )
 
         if st.button("⟳  Convertir todo", type="primary", use_container_width=True):
+            import hashlib
+            prev = st.session_state.results
             st.session_state.results = {}
             st.session_state.active  = None
             bar = st.progress(0, text="Iniciando…")
@@ -695,8 +736,19 @@ with col_left:
                 try:
                     fb = uf.getvalue()
                     if not fb: raise ValueError("Archivo vacío.")
+                    digest = hashlib.md5(fb).hexdigest()
+                    # Dedup: mismo archivo + mismo modo ya convertido → reutilizar
+                    old = prev.get(uf.name)
+                    if (old and old.get("ok") and old.get("digest") == digest
+                            and old.get("include_images") == include_images):
+                        st.session_state.results[uf.name] = old
+                        continue
                     r = run_conversion(fb, uf.name, include_images)
-                    st.session_state.results[uf.name] = {"ok": True, **r}
+                    del fb
+                    st.session_state.results[uf.name] = {
+                        "ok": True, "digest": digest,
+                        "include_images": include_images, **r,
+                    }
                 except Exception as e:
                     st.session_state.results[uf.name] = {"ok": False, "filename": uf.name, "error": str(e)}
             bar.progress(1.0, text="¡Listo!")
@@ -809,7 +861,14 @@ with col_right:
 
         with tab_prev:
             # FIX 1: Strip base64 URIs before sending to browser — prevents freeze
+            # FIX: truncar también la vista previa — renderizar MBs de markdown
+            # en cada rerun congela el navegador y arrastra toda la app
+            # (síntoma: "el documento siguiente se demora mucho").
             preview_md = _strip_data_uris(md)
+            if len(preview_md) > PREVIEW_CHARS:
+                st.caption(f"Vista previa de los primeros {PREVIEW_CHARS:,} caracteres. "
+                           "Descarga el .md para el contenido completo.")
+                preview_md = preview_md[:PREVIEW_CHARS] + "\n\n…*(descarga el archivo para ver el resto)*"
             st.markdown('<div class="md-preview">', unsafe_allow_html=True)
             st.markdown(preview_md, unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
