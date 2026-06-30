@@ -305,7 +305,14 @@ def convert_pdf(file_bytes, filename, include_images=True):
             # FIX: text-only is 3–5x faster — larger chunks, no disk I/O for images
             CHUNK = 50
             parts = [pymupdf4llm.to_markdown(doc, filename=filename,
-                                             pages=list(range(s, min(s + CHUNK, total))))
+                                             pages=list(range(s, min(s + CHUNK, total))),
+                                             # ignore_graphics: sin esto, las páginas con
+                                             # muchos vectores (tablas financieras dibujadas
+                                             # con cientos de líneas/celdas) se rasterizan
+                                             # como UNA imagen y se pierde TODO el texto y los
+                                             # números. Ignorando el dibujo vectorial decorativo
+                                             # se extrae el texto/cifras de la tabla como texto.
+                                             ignore_graphics=True)
                      for s in range(0, total, CHUNK)]
             md = re.sub(r'\n{4,}', '\n\n\n', "\n\n".join(parts))
             return md, label
@@ -324,6 +331,10 @@ def convert_pdf(file_bytes, filename, include_images=True):
                     write_images=True,
                     image_path=tmp,
                     image_format="png",
+                    # ver nota en la rama sin imágenes: ignore_graphics evita que las
+                    # tablas (dibujadas como miles de vectores) se rastericen y se
+                    # pierda el texto. Las fotos raster reales se siguen incrustando.
+                    ignore_graphics=True,
                 )
                 parts.append(chunk_md)
 
